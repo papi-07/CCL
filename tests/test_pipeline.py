@@ -383,6 +383,6 @@ class TestEndToEndPipeline:
         for col in ["cost_rank", "product", "fy26q2_forecast", "ts_class"]:
             assert col in forecast_df.columns, f"Missing column: {col}"
 
-    def test_forecast_are_integers(self, forecast_df):
+    def test_forecasts_are_integers(self, forecast_df):
         for val in forecast_df["fy26q2_forecast"]:
             assert val == float(int(val)), f"Non-integer forecast: {val}"
