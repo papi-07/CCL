@@ -9,6 +9,10 @@ no-look-ahead policy enforced by the feature-engineering lag shifts).
 The competition accuracy metric is used throughout:
 
     accuracy = 1 - |forecast - actual| / actual
+
+Recent folds are weighted more heavily (``recency_decay`` parameter) so
+that the weight computation reflects current behaviour rather than a
+uniform average over the full backtest horizon.
 """
 
 from __future__ import annotations
@@ -48,23 +52,28 @@ def rolling_backtest(
     feature_cols: list[str],
     models: Optional[list[BaseModel]] = None,
     min_train_size: int = 4,
+    recency_decay: float = 0.85,
 ) -> pd.DataFrame:
     """Run rolling-origin backtesting for a single product.
 
     Parameters
     ----------
-    product_df   : rows for one product, sorted by ``quarter_idx``,
-                   including a final row for the target quarter
-                   (``actual_units = NaN``).
-    feature_cols : feature column names for ML models.
-    models       : list of model instances; defaults to ``get_default_models()``.
+    product_df    : rows for one product, sorted by ``quarter_idx``,
+                    including a final row for the target quarter
+                    (``actual_units = NaN``).
+    feature_cols  : feature column names for ML models.
+    models        : list of model instances; defaults to ``get_default_models()``.
     min_train_size: minimum number of training observations before we start
                     evaluating.
+    recency_decay : exponential decay applied to fold weights – the most
+                    recent fold has weight 1.0, earlier folds have weight
+                    ``recency_decay^k`` where k is the lag from the last fold.
 
     Returns
     -------
     pd.DataFrame
-        Columns: quarter, actual_units, <model_name>_pred, accuracy_<model_name>
+        Columns: quarter, actual_units, fold_weight,
+                 <model_name>_pred, accuracy_<model_name>, error_<model_name>
     """
     if models is None:
         models = get_default_models()
@@ -93,7 +102,7 @@ def rolling_backtest(
         for model in models:
             try:
                 if model.name in ("holt_winters", "arima", "naive_seasonal"):
-                    model.fit(y_train, y_train)
+                    model.fit(y_train, y_train, feature_names=feature_cols)
                     pred = float(model.predict(X_val)[0])
                 else:
                     valid_train = train.dropna(subset=["actual_units"])
@@ -102,7 +111,7 @@ def rolling_backtest(
                     else:
                         y_tr = valid_train["actual_units"].values.astype(float)
                         X_tr = valid_train[feature_cols].values.astype(float)
-                        model.fit(X_tr, y_tr)
+                        model.fit(X_tr, y_tr, feature_names=feature_cols)
                         pred = float(model.predict(X_val)[0])
             except Exception:
                 pred = float(np.nanmean(y_train))
@@ -110,10 +119,19 @@ def rolling_backtest(
             pred = max(0.0, pred)
             record[f"{model.name}_pred"] = pred
             record[f"accuracy_{model.name}"] = accuracy_score(pred, actual)
+            # Signed error (positive = over-forecast, negative = under-forecast)
+            record[f"error_{model.name}"] = pred - actual
 
         results.append(record)
 
-    return pd.DataFrame(results)
+    bt = pd.DataFrame(results)
+    if bt.empty:
+        return bt
+
+    # Assign recency weights: most-recent fold = 1.0, earlier folds decay
+    n_folds = len(bt)
+    bt["fold_weight"] = [recency_decay ** (n_folds - 1 - i) for i in range(n_folds)]
+    return bt
 
 
 # ───────────────────────── portfolio-level backtest ──────────────────────────
@@ -122,14 +140,19 @@ def portfolio_backtest(
     feature_df: pd.DataFrame,
     models: Optional[list[BaseModel]] = None,
     min_train_size: int = 4,
+    recency_decay: float = 0.85,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run rolling-origin backtesting for all products.
 
+    Parameters
+    ----------
+    recency_decay : fold-weighting decay passed to ``rolling_backtest``.
+
     Returns
     -------
-    detail_df  : per-product, per-quarter backtest results
-    summary_df : per-product mean accuracy across backtest windows,
-                 plus an 'optimal_weights' dict column for the ensemble.
+    detail_df  : per-product, per-quarter backtest results (with fold_weight)
+    summary_df : per-product mean accuracy, bias per model, optimal weights,
+                 best model name.
     """
     if models is None:
         models = get_default_models()
@@ -142,7 +165,7 @@ def portfolio_backtest(
         grp_sorted = grp.sort_values("quarter_idx")
         bt = rolling_backtest(
             grp_sorted, feature_cols, models=models,
-            min_train_size=min_train_size
+            min_train_size=min_train_size, recency_decay=recency_decay,
         )
         if bt.empty:
             continue
@@ -151,28 +174,68 @@ def portfolio_backtest(
         all_results.append(bt)
 
         model_names = [m.name for m in models]
-        acc_cols = [f"accuracy_{m}" for m in model_names]
-        mean_accs = {}
-        for col in acc_cols:
-            if col in bt.columns:
-                mean_accs[col.replace("accuracy_", "")] = float(
-                    bt[col].dropna().mean()
-                )
+        fold_w = bt["fold_weight"].values
 
-        # Weights proportional to mean accuracy (softmax-style)
+        mean_accs: dict[str, float] = {}
+        mean_bias: dict[str, float] = {}
+
+        for mname in model_names:
+            acc_col = f"accuracy_{mname}"
+            err_col = f"error_{mname}"
+
+            if acc_col in bt.columns:
+                acc_vals = bt[acc_col].values.astype(float)
+                finite_mask = np.isfinite(acc_vals)
+                if finite_mask.any():
+                    w = fold_w[finite_mask]
+                    mean_accs[mname] = float(
+                        np.average(acc_vals[finite_mask], weights=w)
+                    )
+                else:
+                    mean_accs[mname] = 0.0
+
+            if err_col in bt.columns:
+                err_vals = bt[err_col].values.astype(float)
+                finite_mask = np.isfinite(err_vals)
+                if finite_mask.any():
+                    w = fold_w[finite_mask]
+                    mean_bias[mname] = float(
+                        np.average(err_vals[finite_mask], weights=w)
+                    )
+                else:
+                    mean_bias[mname] = 0.0
+
+        # ── Product-wise model selection: softmax-sharpen weights ─────────
+        # Boost the best model's weight more aggressively than linear scaling.
+        best_model = max(mean_accs, key=mean_accs.get) if mean_accs else None
+
         if mean_accs:
             raw_weights = np.array(list(mean_accs.values()), dtype=float)
             raw_weights = np.where(np.isfinite(raw_weights), raw_weights, 0.0)
             raw_weights = np.clip(raw_weights, 0.0, None)
-            total = raw_weights.sum()
-            weights = raw_weights / total if total > 0 else np.ones_like(raw_weights) / len(raw_weights)
+
+            # Softmax sharpening: raise to power 2 to boost the best model
+            sharpened = raw_weights ** 2
+            total = sharpened.sum()
+            weights = (
+                sharpened / total
+                if total > 0
+                else np.ones_like(sharpened) / len(sharpened)
+            )
             optimal_weights = dict(zip(mean_accs.keys(), weights.tolist()))
         else:
             optimal_weights = {}
 
-        row = {"product": product, "optimal_weights": optimal_weights}
+        row: dict[str, object] = {
+            "product":         product,
+            "optimal_weights": optimal_weights,
+            "best_model":      best_model,
+            "bias":            mean_bias,
+        }
         for k, v in mean_accs.items():
             row[f"mean_accuracy_{k}"] = v
+        for k, v in mean_bias.items():
+            row[f"bias_{k}"] = v
         summary_rows.append(row)
 
     detail_df  = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()

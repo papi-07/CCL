@@ -140,6 +140,28 @@ def _add_rolling_features(
     return df
 
 
+def _add_recency_weighted_features(
+    df: pd.DataFrame,
+    col: str,
+    alpha: float = 0.7,
+    group_col: str = "product",
+) -> pd.DataFrame:
+    """Add an exponentially weighted moving average (EWMA) feature.
+
+    Recent quarters are weighted more heavily (demand sensing).
+    The value is shifted by 1 to prevent look-ahead leakage.
+
+    Parameters
+    ----------
+    alpha : EWM smoothing factor – higher = more weight on recent periods.
+    """
+    df = df.sort_values([group_col, "quarter_idx"])
+    df[f"{col}_ewma"] = df.groupby(group_col)[col].transform(
+        lambda s: s.shift(1).ewm(alpha=alpha, adjust=False, min_periods=1).mean()
+    )
+    return df
+
+
 # ───────────────────────────── main builder ──────────────────────────────────
 
 def build_feature_matrix(
@@ -217,6 +239,13 @@ def build_feature_matrix(
         if sig in actuals.columns:
             actuals = _add_lag_features(actuals, sig, lags=(1, 2))
             actuals = _add_rolling_features(actuals, sig, windows=(2,))
+
+    # ── 7b. Demand-sensing: recency-weighted (EWMA) features ─────────────────
+    # Recent quarters receive exponentially higher weight (alpha=0.7).
+    # Applied after lags so EWMA can use the raw shifted signal.
+    for sig in ("actual_units", "scms_total", "vms_total"):
+        if sig in actuals.columns:
+            actuals = _add_recency_weighted_features(actuals, sig)
 
     # ── 8. Growth-rate features ──────────────────────────────────────────────
     actuals = actuals.sort_values(["product", "quarter_idx"])

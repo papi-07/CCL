@@ -39,6 +39,7 @@ except ImportError:
     _HAS_XGB = False
 
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
 
 
 # ─────────────────────────────── base class ──────────────────────────────────
@@ -48,7 +49,12 @@ class BaseModel:
 
     name: str = "base"
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "BaseModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "BaseModel":
         raise NotImplementedError
 
     def predict(self, X_pred: np.ndarray) -> np.ndarray:
@@ -67,7 +73,12 @@ class HoltWintersModel(BaseModel):
         self._model = None
         self._last_forecast: Optional[float] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "HoltWintersModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "HoltWintersModel":
         series = np.asarray(y_train, dtype=float)
         series = np.where(np.isfinite(series), series, np.nanmean(series))
         series = np.maximum(series, 0.0)
@@ -117,7 +128,12 @@ class ARIMAModel(BaseModel):
         self.seasonal_order = seasonal_order
         self._last_forecast: Optional[float] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "ARIMAModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "ARIMAModel":
         series = np.asarray(y_train, dtype=float)
         series = np.where(np.isfinite(series), series, np.nanmean(series))
         series = np.maximum(series, 0.0)
@@ -163,7 +179,12 @@ class NaiveSeasonalModel(BaseModel):
         self.seasonal_periods = seasonal_periods
         self._last_forecast: Optional[float] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "NaiveSeasonalModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "NaiveSeasonalModel":
         series = np.asarray(y_train, dtype=float)
         valid = series[np.isfinite(series)]
         if len(valid) >= self.seasonal_periods:
@@ -203,13 +224,22 @@ class LightGBMModel(BaseModel):
         self.params = default
         self._model: Optional[object] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "LightGBMModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "LightGBMModel":
         if not _HAS_LGB:
             raise ImportError("lightgbm is not installed")
         X = np.nan_to_num(np.asarray(X_train, dtype=float), nan=0.0)
         y = np.asarray(y_train, dtype=float)
-        self._model = lgb.LGBMRegressor(**self.params)
-        self._model.fit(X, y)
+        if feature_names is not None:
+            self._model = lgb.LGBMRegressor(**self.params)
+            self._model.fit(X, y, feature_name=list(feature_names))
+        else:
+            self._model = lgb.LGBMRegressor(**self.params)
+            self._model.fit(X, y)
         return self
 
     def predict(self, X_pred: np.ndarray) -> np.ndarray:
@@ -244,7 +274,12 @@ class XGBoostModel(BaseModel):
         self.params = default
         self._model: Optional[object] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "XGBoostModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "XGBoostModel":
         if not _HAS_XGB:
             raise ImportError("xgboost is not installed")
         X = np.nan_to_num(np.asarray(X_train, dtype=float), nan=0.0)
@@ -281,7 +316,12 @@ class RandomForestModel(BaseModel):
         self.params = default
         self._model: Optional[object] = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "RandomForestModel":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "RandomForestModel":
         X = np.nan_to_num(np.asarray(X_train, dtype=float), nan=0.0)
         y = np.asarray(y_train, dtype=float)
         self._model = RandomForestRegressor(**self.params)
@@ -299,6 +339,66 @@ class RandomForestModel(BaseModel):
         return None
 
 
+# ─────────────────────────── VMS/SCMS regression ─────────────────────────────
+
+class VMSSCMSRegressionModel(BaseModel):
+    """Ridge regression model driven primarily by VMS and SCMS signals.
+
+    When ``feature_names`` is provided to ``fit()``, only VMS/SCMS and the
+    most-recent lag columns are used as regressors (giving the model its
+    signal-specific character).  Without ``feature_names`` it falls back to
+    using all features as a regularised linear model.
+    """
+
+    name = "vms_scms_reg"
+
+    # Keywords used to select the most-relevant predictor columns
+    _SIGNAL_KEYWORDS = ("vms_total", "scms_total", "actual_units_lag", "actual_units_ewma")
+
+    def __init__(self, alpha: float = 1.0):
+        self.alpha = alpha
+        self._model: Optional[Ridge] = None
+        self._selected_cols: Optional[list[int]] = None
+        self._fallback_mean: float = 0.0
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: Optional[list[str]] = None,
+    ) -> "VMSSCMSRegressionModel":
+        X = np.nan_to_num(np.asarray(X_train, dtype=float), nan=0.0)
+        y = np.asarray(y_train, dtype=float)
+        self._fallback_mean = float(np.nanmean(y)) if len(y) > 0 else 0.0
+
+        if feature_names is not None:
+            cols = [
+                i for i, n in enumerate(feature_names)
+                if any(kw in n for kw in self._SIGNAL_KEYWORDS)
+            ]
+            if cols:
+                self._selected_cols = cols
+                X = X[:, cols]
+        else:
+            self._selected_cols = None
+
+        if X.shape[0] < 2 or X.shape[1] == 0:
+            self._model = None
+            return self
+
+        self._model = Ridge(alpha=self.alpha)
+        self._model.fit(X, y)
+        return self
+
+    def predict(self, X_pred: np.ndarray) -> np.ndarray:
+        if self._model is None:
+            return np.array([self._fallback_mean])
+        X = np.nan_to_num(np.asarray(X_pred, dtype=float), nan=0.0)
+        if self._selected_cols is not None:
+            X = X[:, self._selected_cols]
+        return self._model.predict(X)
+
+
 # ─────────────────────────── model registry ──────────────────────────────────
 
 def get_default_models() -> list[BaseModel]:
@@ -308,6 +408,7 @@ def get_default_models() -> list[BaseModel]:
         ARIMAModel(),
         NaiveSeasonalModel(),
         RandomForestModel(),
+        VMSSCMSRegressionModel(),
     ]
     if _HAS_LGB:
         models.append(LightGBMModel())

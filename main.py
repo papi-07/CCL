@@ -31,8 +31,8 @@ def main() -> None:
 
     print("\n── FY26 Q2 Forecast Summary ──────────────────────────────")
     display_cols = [
-        "cost_rank", "product", "ts_class",
-        "fy26q2_forecast", "expert_mean",
+        "cost_rank", "product", "ts_class", "best_model",
+        "fy26q2_forecast", "expert_mean", "expert_blend_pred",
         "dp_forecast", "mktg_forecast", "ds_forecast",
     ]
     display_cols = [c for c in display_cols if c in results.columns]
