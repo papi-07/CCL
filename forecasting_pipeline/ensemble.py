@@ -182,6 +182,7 @@ def build_ensemble_forecast(
     model_mean_accuracy: float = 0.5,
     expert_accuracy_estimate: float = 0.5,
     expert_override_threshold: float = 0.1,
+    disagreement_threshold: float = 0.50,
 ) -> dict[str, object]:
     """Train all models on full history and return the blended forecast.
 
@@ -213,12 +214,18 @@ def build_ensemble_forecast(
     expert_override_threshold : if ``expert_accuracy_estimate`` exceeds
                                 ``model_mean_accuracy`` by this margin, the
                                 expert prediction replaces the ensemble.
+    disagreement_threshold    : relative disagreement between expert and model-
+                                only prediction, defined as
+                                ``|expert_pred - model_only| / model_only``.
+                                When this ratio exceeds the threshold, equal
+                                (0.5 / 0.5) blending is used instead of the
+                                confidence-based dynamic weight.
 
     Returns
     -------
     dict with keys: product, <model>_pred, ensemble_forecast,
                     weights_used, feature_importances, bias_applied,
-                    expert_override_applied
+                    expert_override_applied, disagreement_blend
     """
     y_train = train_df["actual_units"].values.astype(float)
     X_train = train_df[feature_cols].values.astype(float)
@@ -264,6 +271,9 @@ def build_ensemble_forecast(
     # When the expert accuracy estimate clearly beats the model ensemble
     # accuracy (by `expert_override_threshold`), substitute expert prediction.
     expert_override_applied = False
+    disagreement_blend = False
+    blended_weights: dict[str, float]
+
     if (
         expert_pred is not None
         and np.isfinite(expert_pred)
@@ -274,12 +284,25 @@ def build_ensemble_forecast(
         blended_weights = {"expert_override": 1.0}
         expert_override_applied = True
     else:
+        # ── Expert-model disagreement handling ───────────────────────────────
+        # Compute model-only prediction (without expert signal) to measure
+        # how far the expert departs from the ML ensemble.
+        effective_expert_weight = dynamic_expert_weight
+        if expert_pred is not None and np.isfinite(expert_pred) and expert_pred >= 0:
+            model_only = ensemble_predict(predictions, weights)
+            if model_only > 0:
+                relative_diff = abs(expert_pred - model_only) / model_only
+                if relative_diff > disagreement_threshold:
+                    # Large disagreement: use equal weights to hedge uncertainty.
+                    effective_expert_weight = 0.5
+                    disagreement_blend = True
+
         # ── Include expert blend as an additional signal ─────────────────────
-        blended_weights = {k: w * (1.0 - dynamic_expert_weight)
+        blended_weights = {k: w * (1.0 - effective_expert_weight)
                            for k, w in weights.items()}
         if expert_pred is not None and np.isfinite(expert_pred) and expert_pred >= 0:
             predictions["expert_blend"] = expert_pred
-            blended_weights["expert_blend"] = dynamic_expert_weight
+            blended_weights["expert_blend"] = effective_expert_weight
         else:
             blended_weights = weights
 
@@ -294,6 +317,7 @@ def build_ensemble_forecast(
         "feature_importances":    feature_importances,
         "bias_applied":           bias_correction or {},
         "expert_override_applied": expert_override_applied,
+        "disagreement_blend":     disagreement_blend,
     }
     result.update({f"{k}_pred": v for k, v in predictions.items()})
     return result

@@ -33,6 +33,14 @@ from forecasting_pipeline.ensemble import (
 )
 from forecasting_pipeline.postprocessing import postprocess
 
+# Model confidence below this threshold triggers the last-actual fallback.
+_LOW_CONF_THRESHOLD = 0.20
+
+# Dampening factor for the Q2 seasonal index.
+# Moves the seasonal factor halfway between 1.0 and the raw Q2/average ratio
+# to avoid overcorrecting when the model already captures seasonality.
+_SEASONAL_DAMPENING = 0.5
+
 
 def run_pipeline(
     data_file: str = _DATA_FILE,
@@ -75,8 +83,10 @@ def run_pipeline(
         expert_mean, expert_blend_pred,
         best_model, optimal_weights, bias_applied,
         expert_weights_used, feature_importances,
-        expert_override_applied, model_confidence,
-        calibration_factor
+        expert_override_applied, disagreement_blend,
+        model_confidence, calibration_factor,
+        seasonal_factor, global_bias_correction,
+        low_conf_fallback
     """
     # ── 0. Load data ─────────────────────────────────────────────────────────
     if verbose:
@@ -110,7 +120,7 @@ def run_pipeline(
 
     # Use separate model instances for backtesting to avoid state bleed
     bt_models = [type(m)() for m in models]
-    _, summary_df = portfolio_backtest(
+    detail_df, summary_df = portfolio_backtest(
         feat_df, models=bt_models,
         min_train_size=min_train_size,
         recency_decay=recency_decay,
@@ -124,6 +134,21 @@ def run_pipeline(
             print("      Portfolio mean accuracy by model (recency-weighted):")
             for col in acc_cols:
                 print(f"        {col}: {summary_df[col].mean():.4f}")
+
+    # ── Global bias correction ────────────────────────────────────────────────
+    # Compute portfolio-level mean residual bias from the backtest error columns.
+    # This catches any systematic over/under-forecasting at the portfolio level
+    # that was not captured by the per-product per-model bias corrections.
+    global_bias = 0.0
+    if not detail_df.empty:
+        error_cols = [c for c in detail_df.columns if c.startswith("error_")]
+        if error_cols:
+            all_errors = detail_df[error_cols].values.astype(float).flatten()
+            finite_errors = all_errors[np.isfinite(all_errors)]
+            if len(finite_errors) > 0:
+                global_bias = float(np.mean(finite_errors))
+    if verbose:
+        print(f"      Global bias correction: {global_bias:.4f}")
 
     # Build per-product weight, bias, confidence, and accuracy lookups
     weight_lookup:     dict[str, dict[str, float]] = {}
@@ -194,11 +219,26 @@ def run_pipeline(
         life_cycle  = str(tgt_row.get("life_cycle", "Sustaining"))
         ts_class    = str(tgt_row.get("ts_class", "stable"))
         hist_units  = product_hist["actual_units"].values.astype(float)
-        last_actual = float(
-            product_hist["actual_units"].dropna().iloc[-1]
-            if not product_hist["actual_units"].dropna().empty
-            else 0.0
-        )
+
+        actuals_series = product_hist["actual_units"].dropna()
+        last_actual = float(actuals_series.iloc[-1]) if not actuals_series.empty else 0.0
+        prev_actual = float(actuals_series.iloc[-2]) if len(actuals_series) >= 2 else np.nan
+
+        # ── Per-product Q2 seasonal factor ───────────────────────────────────
+        # Compute the ratio of mean Q2 actuals to the overall mean.
+        # Apply with 50 % dampening to avoid overcorrection (the ML models
+        # already capture some seasonality via is_Q2 and lag-4 features).
+        q2_hist = product_hist[
+            product_hist["quarter"].str.endswith("Q2")
+        ]["actual_units"].dropna()
+        seasonal_factor = 1.0
+        if len(q2_hist) >= 1 and len(actuals_series) >= 2:
+            all_mean = float(actuals_series.mean())
+            if all_mean > 0:
+                q2_mean = float(q2_hist.mean())
+                q2_ratio = q2_mean / all_mean
+                # Dampen: move halfway between 1.0 and the raw ratio
+                seasonal_factor = 1.0 + _SEASONAL_DAMPENING * (q2_ratio - 1.0)
 
         # ── Intermittent demand: use median of last non-zero actuals ──────────
         _use_intermittent = False
@@ -217,11 +257,13 @@ def run_pipeline(
                     "feature_importances":    {},
                     "bias_applied":           {},
                     "expert_override_applied": False,
+                    "disagreement_blend":     False,
                 }
                 for m in models:
                     result[f"{m.name}_pred"] = np.nan
                 _use_intermittent = True
 
+        _low_conf_fallback = False
         if not _use_intermittent:
             result = build_ensemble_forecast(
                 product=product,
@@ -240,13 +282,29 @@ def run_pipeline(
             )
 
             raw_forecast = result["ensemble_forecast"]
+
+            # ── Global bias correction ────────────────────────────────────────
+            # Subtract the portfolio-level systematic residual bias.
+            raw_forecast = max(0.0, raw_forecast - global_bias)
+
+            # ── Q2 seasonal adjustment ────────────────────────────────────────
+            raw_forecast = max(0.0, raw_forecast * seasonal_factor)
+
             final = postprocess(
                 forecast=raw_forecast,
                 historical_units=hist_units,
                 last_actual=last_actual,
+                prev_actual=prev_actual,
                 life_cycle=life_cycle,
                 ts_class=ts_class,
             )
+
+            # ── Low-confidence fallback ───────────────────────────────────────
+            # When the model is highly uncertain (backtest variance too high),
+            # fall back to the last observed actual as a safe baseline.
+            if model_conf < _LOW_CONF_THRESHOLD and last_actual > 0:
+                final = float(round(last_actual))
+                _low_conf_fallback = True
 
         # Expert average (unweighted, for reference)
         expert_vals = [
@@ -288,8 +346,12 @@ def run_pipeline(
             "expert_weights_used":    str(exp_weights),
             "feature_importances":    str(fi_summary),
             "expert_override_applied": result.get("expert_override_applied", False),
+            "disagreement_blend":     result.get("disagreement_blend", False),
             "model_confidence":       model_conf,
             "calibration_factor":     1.0,   # filled after portfolio calibration
+            "seasonal_factor":        seasonal_factor,
+            "global_bias_correction": global_bias,
+            "low_conf_fallback":      _low_conf_fallback,
         }
         for m in models:
             record[f"{m.name}_pred"] = result.get(f"{m.name}_pred", np.nan)

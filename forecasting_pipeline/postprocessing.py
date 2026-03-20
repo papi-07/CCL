@@ -9,7 +9,9 @@ Steps applied:
    Decline products are more aggressively capped on the upside.
 4. Anchor constraint: limit predictions within 0.7×–1.3× of last actual
    (skipped for NPI-Ramp products to allow natural ramp-up).
-5. Round to the nearest integer (products are counted in whole units).
+5. Direction-aware constraint: prevent forecast from contradicting recent
+   trend direction (skipped for NPI-Ramp and intermittent products).
+6. Round to the nearest integer (products are counted in whole units).
 """
 
 from __future__ import annotations
@@ -89,6 +91,48 @@ def anchor_constraint(
     return float(np.clip(forecast, lower, upper))
 
 
+def direction_constraint(
+    forecast: float,
+    last_actual: float,
+    prev_actual: float,
+    tolerance: float = 0.10,
+) -> float:
+    """Prevent the forecast from contradicting the recent demand trend.
+
+    If the most-recent quarter (``last_actual``) shows an upward trend
+    relative to the quarter before it (``prev_actual``), the forecast is
+    floored at ``last_actual × (1 - tolerance)`` so a sharply bearish
+    prediction cannot negate a rising trend.
+
+    Conversely, during a downtrend the forecast is capped at
+    ``last_actual × (1 + tolerance)`` to prevent an unrealistic reversal.
+
+    A flat trend or unavailable / zero / non-finite actuals leaves the
+    forecast unchanged (no-op).
+
+    Parameters
+    ----------
+    forecast     : candidate forecast value
+    last_actual  : most-recent known actual (lag-1)
+    prev_actual  : second-most-recent known actual (lag-2)
+    tolerance    : permitted deviation from the trend direction (default 0.10)
+    """
+    if not (
+        np.isfinite(last_actual) and last_actual > 0
+        and np.isfinite(prev_actual) and prev_actual > 0
+    ):
+        return forecast
+
+    if last_actual > prev_actual:  # uptrend: enforce a floor
+        floor = last_actual * (1.0 - tolerance)
+        return float(max(forecast, floor))
+    elif last_actual < prev_actual:  # downtrend: enforce a ceiling
+        ceiling = last_actual * (1.0 + tolerance)
+        return float(min(forecast, ceiling))
+    # flat trend: no constraint
+    return forecast
+
+
 def _lifecycle_change_ratio(
     life_cycle: str,
     ts_class: str,
@@ -133,6 +177,9 @@ def postprocess(
     apply_anchor: bool = True,
     anchor_lower: float = 0.7,
     anchor_upper: float = 1.3,
+    apply_direction: bool = True,
+    prev_actual: float = np.nan,
+    trend_tolerance: float = 0.10,
     round_to_int: bool = True,
     life_cycle: str = "Sustaining",
     ts_class: str = "stable",
@@ -153,6 +200,11 @@ def postprocess(
                         disabled for NPI-Ramp and intermittent products.
     anchor_lower      : lower factor for anchor constraint (default 0.7)
     anchor_upper      : upper factor for anchor constraint (default 1.3)
+    apply_direction   : whether to apply the direction-aware constraint.
+                        Automatically disabled for NPI-Ramp and intermittent.
+    prev_actual       : second-most-recent known actual (lag-2), used for the
+                        direction-aware constraint (NaN disables it).
+    trend_tolerance   : permitted deviation from trend direction (default 0.10)
     round_to_int      : round to nearest integer (True by default)
     life_cycle        : product lifecycle stage ("Sustaining", "NPI-Ramp",
                         "Decline", …)
@@ -176,12 +228,21 @@ def postprocess(
         and str(ts_class).strip() != "intermittent"
     )
 
+    # Direction-aware constraint is also skipped for NPI-Ramp and intermittent.
+    do_direction = (
+        apply_direction
+        and str(life_cycle).strip() != "NPI-Ramp"
+        and str(ts_class).strip() != "intermittent"
+    )
+
     fc = clip_negatives(forecast)
     fc = cap_outliers(fc, historical_units, iqr_multiplier)
     if do_jump:
         fc = smooth_jump(fc, last_actual, ratio)
     if do_anchor:
         fc = anchor_constraint(fc, last_actual, anchor_lower, anchor_upper)
+    if do_direction:
+        fc = direction_constraint(fc, last_actual, prev_actual, trend_tolerance)
     if round_to_int:
         fc = float(round(fc))
     return fc
