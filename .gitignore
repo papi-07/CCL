@@ -1,0 +1,6 @@
+fy26q2_forecasts.csv
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
