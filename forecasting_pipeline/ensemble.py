@@ -2,14 +2,19 @@
 Weighted ensemble that blends predictions from all constituent models.
 
 Ensemble weights are derived from the rolling-origin backtest accuracy
-scores (higher accuracy ⟹ higher weight, sharpened via softmax squaring).
-When backtesting data is insufficient, equal weights are used.
+scores, optimised *directly* for the competition accuracy metric via
+L-BFGS-B.  When backtesting data is insufficient, equal weights are used.
 
 Additional capabilities
 -----------------------
 * Expert forecast blending: DP, Marketing, and Data Science forecasts are
   combined via credibility-weighted averaging and included as an extra
   ensemble signal.
+* Confidence-based blending: the expert weight is scaled by model confidence
+  (from backtest variance), so uncertain models lean more on expert opinions.
+* Expert override: when expert accuracy estimate (lag-4 proximity) clearly
+  exceeds model accuracy by a configurable threshold, the expert prediction
+  replaces the ensemble entirely.
 * Bias correction: per-product per-model bias estimated from backtesting is
   subtracted from predictions before blending.
 """
@@ -83,6 +88,32 @@ def compute_expert_weights(
     return result
 
 
+def compute_expert_accuracy_estimate(
+    row: pd.Series,
+    expert_cols: tuple[str, ...] = _EXPERT_COLS,
+) -> float:
+    """Estimate expert forecast accuracy using proximity to lag-4 baseline.
+
+    Uses the same-quarter-last-year (lag-4) value as a reference.  The
+    accuracy estimate for each expert is  ``1 - |expert - naive| / naive``,
+    clipped to [0, 1].  The mean across available experts is returned.
+
+    Returns 0.5 (neutral) when the naive baseline is unavailable.
+    """
+    naive = float(row.get("actual_units_lag4", np.nan))
+    if not np.isfinite(naive) or naive <= 0:
+        return 0.5
+
+    accuracies: list[float] = []
+    for col in expert_cols:
+        val = row.get(col, np.nan)
+        if pd.notna(val) and np.isfinite(float(val)) and float(val) > 0:
+            rel_err = abs(float(val) - naive) / naive
+            accuracies.append(float(np.clip(1.0 - rel_err, 0.0, 1.0)))
+
+    return float(np.mean(accuracies)) if accuracies else 0.5
+
+
 def blend_expert_forecasts(
     row: pd.Series,
     expert_weights: dict[str, float],
@@ -147,28 +178,47 @@ def build_ensemble_forecast(
     bias_correction: Optional[dict[str, float]] = None,
     expert_pred: Optional[float] = None,
     expert_weight: float = 0.15,
+    model_confidence: float = 0.5,
+    model_mean_accuracy: float = 0.5,
+    expert_accuracy_estimate: float = 0.5,
+    expert_override_threshold: float = 0.1,
 ) -> dict[str, object]:
     """Train all models on full history and return the blended forecast.
 
     Parameters
     ----------
-    product         : product name (for labelling)
-    train_df        : all historical rows with known ``actual_units``
-    pred_row        : the feature row for the target quarter
-    feature_cols    : ML feature column names
-    models          : list of model instances
-    weights         : {model_name: weight} from backtesting
-    bias_correction : optional {model_name: bias} – subtracted before blending.
-                      Bias = mean(pred - actual) from backtest, so subtracting
-                      it removes systematic over-/under-forecasting.
-    expert_pred     : optional weighted expert forecast to include in ensemble
-    expert_weight   : fraction of ensemble weight given to expert forecast
-                      (remaining ``1 - expert_weight`` distributed to models)
+    product                   : product name (for labelling)
+    train_df                  : all historical rows with known ``actual_units``
+    pred_row                  : the feature row for the target quarter
+    feature_cols              : ML feature column names
+    models                    : list of model instances
+    weights                   : {model_name: weight} from backtesting
+    bias_correction           : optional {model_name: bias} – subtracted before
+                                blending.  Bias = mean(pred - actual) from
+                                backtest so subtracting it removes systematic
+                                over-/under-forecasting.
+    expert_pred               : optional weighted expert forecast to include in
+                                ensemble
+    expert_weight             : *base* fraction of ensemble weight given to the
+                                expert forecast before confidence adjustment.
+    model_confidence          : confidence score in (0,1) from backtest variance.
+                                High confidence → reduce expert weight.
+                                Low confidence  → increase expert weight.
+    model_mean_accuracy       : recency-weighted mean accuracy of the model
+                                ensemble from backtesting (same scale as the
+                                competition metric, 0–1).  Used to decide
+                                whether expert override applies.
+    expert_accuracy_estimate  : proxy accuracy score for the expert blend,
+                                used to decide whether expert override applies.
+    expert_override_threshold : if ``expert_accuracy_estimate`` exceeds
+                                ``model_mean_accuracy`` by this margin, the
+                                expert prediction replaces the ensemble.
 
     Returns
     -------
     dict with keys: product, <model>_pred, ensemble_forecast,
-                    weights_used, feature_importances, bias_applied
+                    weights_used, feature_importances, bias_applied,
+                    expert_override_applied
     """
     y_train = train_df["actual_units"].values.astype(float)
     X_train = train_df[feature_cols].values.astype(float)
@@ -203,24 +253,47 @@ def build_ensemble_forecast(
 
         predictions[model.name] = max(0.0, pred)
 
-    # ── Include expert blend as an additional signal ─────────────────────────
-    blended_weights = {k: w * (1.0 - expert_weight) for k, w in weights.items()}
-    if expert_pred is not None and np.isfinite(expert_pred) and expert_pred >= 0:
-        predictions["expert_blend"] = expert_pred
-        blended_weights["expert_blend"] = expert_weight
-    else:
-        # Re-normalise model weights to 1.0 when no expert forecast available
-        blended_weights = weights
+    # ── Confidence-based dynamic expert weight ───────────────────────────────
+    # High model confidence → lower expert weight; low confidence → higher.
+    # Maps confidence ∈ [0.1, 0.9] → expert_weight scaled by (1.5 - confidence).
+    dynamic_expert_weight = float(
+        np.clip(expert_weight * (1.5 - model_confidence), 0.05, 0.40)
+    )
 
-    ensemble = ensemble_predict(predictions, blended_weights)
+    # ── Expert override ───────────────────────────────────────────────────────
+    # When the expert accuracy estimate clearly beats the model ensemble
+    # accuracy (by `expert_override_threshold`), substitute expert prediction.
+    expert_override_applied = False
+    if (
+        expert_pred is not None
+        and np.isfinite(expert_pred)
+        and expert_pred >= 0
+        and expert_accuracy_estimate > model_mean_accuracy + expert_override_threshold
+    ):
+        ensemble = expert_pred
+        blended_weights = {"expert_override": 1.0}
+        expert_override_applied = True
+    else:
+        # ── Include expert blend as an additional signal ─────────────────────
+        blended_weights = {k: w * (1.0 - dynamic_expert_weight)
+                           for k, w in weights.items()}
+        if expert_pred is not None and np.isfinite(expert_pred) and expert_pred >= 0:
+            predictions["expert_blend"] = expert_pred
+            blended_weights["expert_blend"] = dynamic_expert_weight
+        else:
+            blended_weights = weights
+
+        ensemble = ensemble_predict(predictions, blended_weights)
+
     ensemble = max(0.0, ensemble)
 
     result: dict[str, object] = {
-        "product":           product,
-        "ensemble_forecast": ensemble,
-        "weights_used":      blended_weights,
-        "feature_importances": feature_importances,
-        "bias_applied":      bias_correction or {},
+        "product":                product,
+        "ensemble_forecast":      ensemble,
+        "weights_used":           blended_weights,
+        "feature_importances":    feature_importances,
+        "bias_applied":           bias_correction or {},
+        "expert_override_applied": expert_override_applied,
     }
     result.update({f"{k}_pred": v for k, v in predictions.items()})
     return result

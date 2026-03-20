@@ -29,6 +29,7 @@ from forecasting_pipeline.ensemble import (
     build_ensemble_forecast,
     compute_expert_weights,
     blend_expert_forecasts,
+    compute_expert_accuracy_estimate,
 )
 from forecasting_pipeline.postprocessing import postprocess
 
@@ -40,21 +41,30 @@ def run_pipeline(
     min_train_size: int = 4,
     recency_decay: float = 0.85,
     expert_weight: float = 0.15,
+    expert_override_threshold: float = 0.1,
+    portfolio_calibration: bool = True,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Run the end-to-end forecasting pipeline.
 
     Parameters
     ----------
-    data_file     : path to CFL_External Data Pack_Phase1.xlsx
-    output_csv    : where to save the forecast CSV (None to skip)
-    models        : model list; defaults to ``get_default_models()``
-    min_train_size: minimum quarters before backtesting starts
-    recency_decay : fold-weighting decay for backtesting (recent folds
-                    receive proportionally higher weight)
-    expert_weight : fraction of final ensemble weight given to the
-                    credibility-blended expert forecast (DP / Marketing / DS)
-    verbose       : print progress messages
+    data_file                 : path to CFL_External Data Pack_Phase1.xlsx
+    output_csv                : where to save the forecast CSV (None to skip)
+    models                    : model list; defaults to ``get_default_models()``
+    min_train_size            : minimum quarters before backtesting starts
+    recency_decay             : fold-weighting decay for backtesting (recent
+                                folds receive proportionally higher weight)
+    expert_weight             : *base* fraction of final ensemble weight given
+                                to the credibility-blended expert forecast.
+                                Actual weight is adjusted per-product by
+                                model confidence.
+    expert_override_threshold : margin by which expert accuracy estimate must
+                                beat model accuracy to trigger expert override.
+    portfolio_calibration     : if True, scale all non-NPI forecasts so the
+                                portfolio total matches the last-2-quarter
+                                historical average (±20 % cap).
+    verbose                   : print progress messages
 
     Returns
     -------
@@ -64,16 +74,18 @@ def run_pipeline(
         dp_forecast, mktg_forecast, ds_forecast,
         expert_mean, expert_blend_pred,
         best_model, optimal_weights, bias_applied,
-        expert_weights_used, feature_importances
+        expert_weights_used, feature_importances,
+        expert_override_applied, model_confidence,
+        calibration_factor
     """
     # ── 0. Load data ─────────────────────────────────────────────────────────
     if verbose:
-        print("[1/7] Loading data …")
+        print("[1/8] Loading data …")
     tables = load_all(data_file)
 
     # ── 1. Feature engineering ────────────────────────────────────────────────
     if verbose:
-        print("[2/7] Building feature matrix …")
+        print("[2/8] Building feature matrix …")
     feat_df = build_feature_matrix(
         actuals=tables["actuals"],
         big_deal=tables["big_deal"],
@@ -90,11 +102,11 @@ def run_pipeline(
     if models is None:
         models = get_default_models()
     if verbose:
-        print(f"[3/7] Models: {[m.name for m in models]}")
+        print(f"[3/8] Models: {[m.name for m in models]}")
 
     # ── 3. Portfolio backtesting ──────────────────────────────────────────────
     if verbose:
-        print("[4/7] Running rolling-origin backtesting …")
+        print("[4/8] Running rolling-origin backtesting …")
 
     # Use separate model instances for backtesting to avoid state bleed
     bt_models = [type(m)() for m in models]
@@ -113,10 +125,12 @@ def run_pipeline(
             for col in acc_cols:
                 print(f"        {col}: {summary_df[col].mean():.4f}")
 
-    # Build per-product weight and bias lookups
-    weight_lookup: dict[str, dict[str, float]] = {}
-    bias_lookup:   dict[str, dict[str, float]] = {}
-    best_model_lookup: dict[str, str] = {}
+    # Build per-product weight, bias, confidence, and accuracy lookups
+    weight_lookup:     dict[str, dict[str, float]] = {}
+    bias_lookup:       dict[str, dict[str, float]] = {}
+    best_model_lookup: dict[str, str]              = {}
+    confidence_lookup: dict[str, float]            = {}
+    mean_acc_lookup:   dict[str, float]            = {}
 
     if not summary_df.empty:
         for _, row in summary_df.iterrows():
@@ -127,17 +141,27 @@ def run_pipeline(
                 bias_lookup[p] = row["bias"]
             if pd.notna(row.get("best_model")):
                 best_model_lookup[p] = row["best_model"]
+            if pd.notna(row.get("model_confidence")):
+                confidence_lookup[p] = float(row["model_confidence"])
+            # Mean accuracy across all models for this product
+            acc_vals = [
+                float(row[f"mean_accuracy_{m.name}"])
+                for m in models
+                if f"mean_accuracy_{m.name}" in row and pd.notna(row[f"mean_accuracy_{m.name}"])
+            ]
+            if acc_vals:
+                mean_acc_lookup[p] = float(np.mean(acc_vals))
 
     default_weights = {m.name: 1.0 / len(models) for m in models}
 
     # ── 4. Expert forecast credibility weights ────────────────────────────────
     if verbose:
-        print("[5/7] Computing expert forecast credibility weights …")
+        print("[5/8] Computing expert forecast credibility weights …")
     per_product_expert_weights = compute_expert_weights(feat_df)
 
     # ── 5. Generate final FY26Q2 forecasts ───────────────────────────────────
     if verbose:
-        print("[6/7] Generating FY26Q2 forecasts …")
+        print("[6/8] Generating FY26Q2 forecasts …")
 
     hist_df   = feat_df[feat_df["actual_units"].notna()].copy()
     target_df = feat_df[feat_df["quarter"] == TARGET_FY_QUARTER].copy()
@@ -157,39 +181,72 @@ def run_pipeline(
         bias_corr      = bias_lookup.get(product, {})
         best_model     = best_model_lookup.get(product, "")
         exp_weights    = per_product_expert_weights.get(product, {})
+        model_conf     = confidence_lookup.get(product, 0.5)
 
         # Weighted expert forecast
         expert_pred = blend_expert_forecasts(tgt_row, exp_weights)
 
-        result = build_ensemble_forecast(
-            product=product,
-            train_df=product_hist,
-            pred_row=tgt_row,
-            feature_cols=feature_cols,
-            models=models,
-            weights=weights,
-            bias_correction=bias_corr,
-            expert_pred=expert_pred,
-            expert_weight=expert_weight,
-        )
+        # Expert accuracy estimate (for expert override decision)
+        expert_acc  = compute_expert_accuracy_estimate(tgt_row)
+        model_acc   = mean_acc_lookup.get(product, 0.5)
 
-        # Post-processing with lifecycle awareness
-        life_cycle = str(tgt_row.get("life_cycle", "Sustaining"))
-        ts_class   = str(tgt_row.get("ts_class", "stable"))
-        hist_units = product_hist["actual_units"].values.astype(float)
+        # ── Intermittent demand: use median of last non-zero actuals ──────────
+        life_cycle  = str(tgt_row.get("life_cycle", "Sustaining"))
+        ts_class    = str(tgt_row.get("ts_class", "stable"))
+        hist_units  = product_hist["actual_units"].values.astype(float)
         last_actual = float(
             product_hist["actual_units"].dropna().iloc[-1]
             if not product_hist["actual_units"].dropna().empty
             else 0.0
         )
-        raw_forecast = result["ensemble_forecast"]
-        final = postprocess(
-            forecast=raw_forecast,
-            historical_units=hist_units,
-            last_actual=last_actual,
-            life_cycle=life_cycle,
-            ts_class=ts_class,
-        )
+
+        # ── Intermittent demand: use median of last non-zero actuals ──────────
+        _use_intermittent = False
+        if ts_class == "intermittent":
+            non_zero = hist_units[hist_units > 0]
+            if len(non_zero) >= 2:
+                intermittent_median = float(
+                    np.median(non_zero[-min(6, len(non_zero)):])
+                )
+                raw_forecast  = intermittent_median
+                final         = float(round(intermittent_median))
+                result = {
+                    "product":                product,
+                    "ensemble_forecast":      raw_forecast,
+                    "weights_used":           {"intermittent_median": 1.0},
+                    "feature_importances":    {},
+                    "bias_applied":           {},
+                    "expert_override_applied": False,
+                }
+                for m in models:
+                    result[f"{m.name}_pred"] = np.nan
+                _use_intermittent = True
+
+        if not _use_intermittent:
+            result = build_ensemble_forecast(
+                product=product,
+                train_df=product_hist,
+                pred_row=tgt_row,
+                feature_cols=feature_cols,
+                models=models,
+                weights=weights,
+                bias_correction=bias_corr,
+                expert_pred=expert_pred,
+                expert_weight=expert_weight,
+                model_confidence=model_conf,
+                model_mean_accuracy=model_acc,
+                expert_accuracy_estimate=expert_acc,
+                expert_override_threshold=expert_override_threshold,
+            )
+
+            raw_forecast = result["ensemble_forecast"]
+            final = postprocess(
+                forecast=raw_forecast,
+                historical_units=hist_units,
+                last_actual=last_actual,
+                life_cycle=life_cycle,
+                ts_class=ts_class,
+            )
 
         # Expert average (unweighted, for reference)
         expert_vals = [
@@ -214,22 +271,25 @@ def run_pipeline(
                 }
 
         record = {
-            "cost_rank":            tgt_row.get("cost_rank"),
-            "product":              product,
-            "life_cycle":           life_cycle,
-            "ts_class":             ts_class,
-            "fy26q2_forecast":      final,
-            "ensemble_raw":         raw_forecast,
-            "dp_forecast":          tgt_row.get("dp_forecast"),
-            "mktg_forecast":        tgt_row.get("mktg_forecast"),
-            "ds_forecast":          tgt_row.get("ds_forecast"),
-            "expert_mean":          expert_mean,
-            "expert_blend_pred":    expert_pred if expert_pred is not None else np.nan,
-            "best_model":           best_model,
-            "optimal_weights":      str(result.get("weights_used", {})),
-            "bias_applied":         str(bias_corr),
-            "expert_weights_used":  str(exp_weights),
-            "feature_importances":  str(fi_summary),
+            "cost_rank":              tgt_row.get("cost_rank"),
+            "product":                product,
+            "life_cycle":             life_cycle,
+            "ts_class":               ts_class,
+            "fy26q2_forecast":        final,
+            "ensemble_raw":           raw_forecast,
+            "dp_forecast":            tgt_row.get("dp_forecast"),
+            "mktg_forecast":          tgt_row.get("mktg_forecast"),
+            "ds_forecast":            tgt_row.get("ds_forecast"),
+            "expert_mean":            expert_mean,
+            "expert_blend_pred":      expert_pred if expert_pred is not None else np.nan,
+            "best_model":             best_model,
+            "optimal_weights":        str(result.get("weights_used", {})),
+            "bias_applied":           str(bias_corr),
+            "expert_weights_used":    str(exp_weights),
+            "feature_importances":    str(fi_summary),
+            "expert_override_applied": result.get("expert_override_applied", False),
+            "model_confidence":       model_conf,
+            "calibration_factor":     1.0,   # filled after portfolio calibration
         }
         for m in models:
             record[f"{m.name}_pred"] = result.get(f"{m.name}_pred", np.nan)
@@ -242,13 +302,50 @@ def run_pipeline(
         "cost_rank"
     ).reset_index(drop=True)
 
-    # ── 6. Save output ────────────────────────────────────────────────────────
+    # ── 6. Portfolio calibration ──────────────────────────────────────────────
+    # Scale non-NPI forecasts so portfolio total ≈ last-2-quarter average.
+    # Cap the calibration factor to ±20 % to avoid extreme adjustments.
+    if portfolio_calibration and not forecast_df.empty:
+        if verbose:
+            print("[7/8] Applying portfolio calibration …")
+        cal_mask = forecast_df["life_cycle"] != "NPI-Ramp"
+        cal_products = set(forecast_df.loc[cal_mask, "product"].tolist())
+
+        q_sorted  = sorted(hist_df["quarter_idx"].unique())
+        last_2_q  = q_sorted[-2:] if len(q_sorted) >= 2 else q_sorted
+
+        recent_totals = []
+        for q in last_2_q:
+            q_sum = float(
+                hist_df[
+                    (hist_df["quarter_idx"] == q)
+                    & (hist_df["product"].isin(cal_products))
+                ]["actual_units"].sum()
+            )
+            if q_sum > 0:
+                recent_totals.append(q_sum)
+
+        avg_recent = float(np.mean(recent_totals)) if recent_totals else 0.0
+        fc_total   = float(forecast_df.loc[cal_mask, "fy26q2_forecast"].sum())
+
+        if avg_recent > 0 and fc_total > 0:
+            cal_factor = float(np.clip(avg_recent / fc_total, 0.80, 1.20))
+            forecast_df.loc[cal_mask, "fy26q2_forecast"] = (
+                forecast_df.loc[cal_mask, "fy26q2_forecast"] * cal_factor
+            ).round()
+            forecast_df.loc[cal_mask, "calibration_factor"] = cal_factor
+            if verbose:
+                print(f"      Calibration factor: {cal_factor:.4f} "
+                      f"(forecast_total={fc_total:,.0f}, "
+                      f"recent_avg={avg_recent:,.0f})")
+
+    # ── 7. Save output ────────────────────────────────────────────────────────
     if output_csv:
         out_path = Path(output_csv)
         forecast_df.to_csv(out_path, index=False)
         if verbose:
-            print(f"[7/7] Forecast saved to {out_path.resolve()}")
+            print(f"[8/8] Forecast saved to {out_path.resolve()}")
     elif verbose:
-        print("[7/7] Done (output_csv=None, no file written)")
+        print("[8/8] Done (output_csv=None, no file written)")
 
     return forecast_df

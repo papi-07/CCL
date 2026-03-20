@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 from forecasting_pipeline.feature_engineering import (
     FY_QUARTERS_ORDERED,
@@ -43,6 +44,122 @@ def accuracy_score(forecast: float, actual: float) -> float:
         return np.nan
     raw = 1.0 - abs(forecast - actual) / abs(actual)
     return float(np.clip(raw, 0.0, 1.0))
+
+
+# ──────────────── direct accuracy-metric weight optimisation ─────────────────
+
+def _optimize_weights_for_accuracy(
+    bt: pd.DataFrame,
+    model_names: list[str],
+    fold_weights: np.ndarray,
+) -> dict[str, float]:
+    """Find ensemble weights that *directly* maximise the competition accuracy.
+
+    Uses L-BFGS-B with box constraints (w ∈ [0,1]) and an equality
+    constraint (sum = 1).  Falls back to equal weights on any failure.
+
+    Parameters
+    ----------
+    bt           : backtest results DataFrame with ``<model>_pred`` columns
+                   and an ``actual_units`` column.
+    model_names  : ordered list of model names (same order as weight vector).
+    fold_weights : per-fold recency weight array (len == len(bt)).
+    """
+    pred_cols = [f"{m}_pred" for m in model_names]
+    valid = bt.dropna(subset=["actual_units"]).copy()
+    if len(valid) < 2 or not all(c in valid.columns for c in pred_cols):
+        n = len(model_names)
+        return {m: 1.0 / n for m in model_names}
+
+    actuals = valid["actual_units"].values.astype(float)
+    preds   = np.column_stack(
+        [valid[c].fillna(0).values.astype(float) for c in pred_cols]
+    )
+    fw = fold_weights[: len(valid)]  # align fold weights
+
+    def neg_accuracy(w: np.ndarray) -> float:
+        w = np.maximum(w, 0.0)
+        total_w = w.sum()
+        if total_w == 0:
+            return 1e9  # penalise zero-weight configurations
+        w = w / total_w
+        ensemble = preds @ w
+        acc = np.array(
+            [accuracy_score(float(p), float(a)) for p, a in zip(ensemble, actuals)]
+        )
+        finite_mask = np.isfinite(acc)
+        if not finite_mask.any():
+            return 1e9
+        fw_masked = fw[finite_mask]
+        fw_sum = fw_masked.sum()
+        if fw_sum == 0:
+            return 1e9
+        return -float(np.dot(acc[finite_mask], fw_masked) / fw_sum)
+
+    n = len(model_names)
+    w0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    try:
+        result = minimize(
+            neg_accuracy,
+            w0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 500, "ftol": 1e-9},
+        )
+        w = np.maximum(result.x, 0.0)
+        total = w.sum()
+        if total > 0:
+            w = w / total
+        else:
+            w = np.ones(n) / n
+    except Exception:
+        w = np.ones(n) / n
+    return dict(zip(model_names, w.tolist()))
+
+
+# ─────────────────────── model confidence from backtest ──────────────────────
+
+def _compute_model_confidence(
+    bt: pd.DataFrame,
+    model_names: list[str],
+    fold_weights: np.ndarray,
+) -> float:
+    """Return a confidence score in (0, 1) based on backtest accuracy stability.
+
+    High confidence ⟹ low fold-to-fold variance in ensemble accuracy.
+    Low confidence  ⟹ highly variable accuracy across folds.
+
+    The score is computed as  1 / (1 + CV)  where CV is the coefficient
+    of variation of the per-fold mean accuracy.
+    """
+    acc_cols = [f"accuracy_{m}" for m in model_names if f"accuracy_{m}" in bt.columns]
+    if not acc_cols:
+        return 0.5
+
+    valid = bt.dropna(subset=["actual_units"])
+    if len(valid) < 2:
+        return 0.5
+
+    per_fold_accs = np.nanmean(
+        np.column_stack([valid[c].values.astype(float) for c in acc_cols]),
+        axis=1,
+    )
+    finite_mask = np.isfinite(per_fold_accs)
+    if finite_mask.sum() < 2:
+        return 0.5
+
+    fw = fold_weights[: len(valid)]
+    fw_masked = fw[finite_mask]
+    mean_acc = float(np.average(per_fold_accs[finite_mask], weights=fw_masked))
+    std_acc  = float(np.std(per_fold_accs[finite_mask]))
+
+    if mean_acc <= 0:
+        return 0.5
+
+    cv = std_acc / mean_acc
+    confidence = 1.0 / (1.0 + cv)
+    return float(np.clip(confidence, 0.1, 0.9))
 
 
 # ─────────────────────────── per-product backtesting ─────────────────────────
@@ -205,32 +322,26 @@ def portfolio_backtest(
                 else:
                     mean_bias[mname] = 0.0
 
-        # ── Product-wise model selection: softmax-sharpen weights ─────────
-        # Boost the best model's weight more aggressively than linear scaling.
+        # ── Product-wise model selection: optimise weights for accuracy ───────
+        # Replaces squared-softmax heuristic with direct accuracy maximisation.
         best_model = max(mean_accs, key=mean_accs.get) if mean_accs else None
 
         if mean_accs:
-            raw_weights = np.array(list(mean_accs.values()), dtype=float)
-            raw_weights = np.where(np.isfinite(raw_weights), raw_weights, 0.0)
-            raw_weights = np.clip(raw_weights, 0.0, None)
-
-            # Softmax sharpening: raise to power 2 to boost the best model
-            sharpened = raw_weights ** 2
-            total = sharpened.sum()
-            weights = (
-                sharpened / total
-                if total > 0
-                else np.ones_like(sharpened) / len(sharpened)
+            optimal_weights = _optimize_weights_for_accuracy(
+                bt, model_names, fold_w
             )
-            optimal_weights = dict(zip(mean_accs.keys(), weights.tolist()))
         else:
             optimal_weights = {}
 
+        # ── Model confidence from backtest variance ──────────────────────────
+        model_confidence = _compute_model_confidence(bt, model_names, fold_w)
+
         row: dict[str, object] = {
-            "product":         product,
-            "optimal_weights": optimal_weights,
-            "best_model":      best_model,
-            "bias":            mean_bias,
+            "product":          product,
+            "optimal_weights":  optimal_weights,
+            "best_model":       best_model,
+            "bias":             mean_bias,
+            "model_confidence": model_confidence,
         }
         for k, v in mean_accs.items():
             row[f"mean_accuracy_{k}"] = v

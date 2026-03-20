@@ -255,6 +255,21 @@ def build_feature_matrix(
             actuals["actual_units_lag1"] - actuals[lag_col]
         ) / actuals[lag_col].replace(0, np.nan)
 
+    # ── 8b. Momentum features ────────────────────────────────────────────────
+    # Last-quarter absolute change, rate-of-change, and acceleration.
+    # All computed from already-lagged columns → no look-ahead leakage.
+    actuals["actual_units_mom"] = (
+        actuals["actual_units_lag1"] - actuals["actual_units_lag2"]
+    )
+    lag2_safe = actuals["actual_units_lag2"].replace(0, np.nan)
+    actuals["actual_units_mom_rate"] = (
+        actuals["actual_units_mom"] / lag2_safe
+    )
+    actuals["actual_units_accel"] = (
+        (actuals["actual_units_lag1"] - actuals["actual_units_lag2"])
+        - (actuals["actual_units_lag2"] - actuals["actual_units_lag3"])
+    )
+
     # ── 9. Seasonality encoding ──────────────────────────────────────────────
     # Cisco FY Q1=Aug-Oct, Q2=Nov-Jan, Q3=Feb-Apr, Q4=May-Jul
     actuals["fy_quarter_num"] = actuals["quarter"].str[-1].astype(float)

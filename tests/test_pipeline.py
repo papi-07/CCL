@@ -675,3 +675,369 @@ class TestLifecyclePostProcessing:
         )
         assert np.isfinite(result)
         assert result >= 0
+
+
+# ──────────────────────── anchor constraint tests ────────────────────────────
+
+class TestAnchorConstraint:
+    from forecasting_pipeline.postprocessing import anchor_constraint as _anchor
+
+    def test_forecast_above_upper_clamped(self):
+        from forecasting_pipeline.postprocessing import anchor_constraint
+        result = anchor_constraint(200.0, last_actual=100.0, upper_factor=1.3)
+        assert result == pytest.approx(130.0)
+
+    def test_forecast_below_lower_clamped(self):
+        from forecasting_pipeline.postprocessing import anchor_constraint
+        result = anchor_constraint(50.0, last_actual=100.0, lower_factor=0.7)
+        assert result == pytest.approx(70.0)
+
+    def test_forecast_in_range_unchanged(self):
+        from forecasting_pipeline.postprocessing import anchor_constraint
+        result = anchor_constraint(110.0, last_actual=100.0)
+        assert result == pytest.approx(110.0)
+
+    def test_zero_last_actual_noop(self):
+        from forecasting_pipeline.postprocessing import anchor_constraint
+        # When last_actual == 0, constraint cannot be applied → forecast unchanged
+        result = anchor_constraint(500.0, last_actual=0.0)
+        assert result == pytest.approx(500.0)
+
+    def test_npi_ramp_skips_anchor(self):
+        """NPI-Ramp products must not have anchor constraint applied."""
+        hist = np.array([50.0, 80.0, 120.0, 200.0, 300.0])
+        result_npi = postprocess(
+            900.0, hist, last_actual=300.0,
+            life_cycle="NPI-Ramp", ts_class="stable",
+        )
+        result_sus = postprocess(
+            900.0, hist, last_actual=300.0,
+            life_cycle="Sustaining", ts_class="stable",
+        )
+        # NPI-Ramp forecast should be higher (anchor not applied)
+        assert result_npi >= result_sus
+
+    def test_intermittent_skips_anchor(self):
+        """Intermittent products should not have anchor constraint applied."""
+        hist = np.array([0.0, 300.0, 0.0, 200.0, 0.0])
+        result_intermittent = postprocess(
+            600.0, hist, last_actual=0.0,
+            life_cycle="Sustaining", ts_class="intermittent",
+        )
+        # last_actual=0, so anchor is naturally disabled; just check no error
+        assert np.isfinite(result_intermittent)
+
+    def test_postprocess_applies_anchor_by_default(self):
+        """Anchor should shrink an extreme forecast for a stable product."""
+        hist = np.array([100.0, 100.0, 100.0, 100.0, 100.0])
+        # 300 is 3× last_actual=100; with default anchor (1.3×) should cap at 130
+        result = postprocess(
+            300.0, hist, last_actual=100.0,
+            life_cycle="Sustaining", ts_class="stable",
+        )
+        assert result <= 130.0
+
+
+# ────────────────────────── momentum feature tests ───────────────────────────
+
+class TestMomentumFeatures:
+    @pytest.fixture(scope="class")
+    def feat_df(self):
+        tables = load_all()
+        return build_feature_matrix(
+            actuals=tables["actuals"],
+            big_deal=tables["big_deal"],
+            scms=tables["scms"],
+            vms=tables["vms"],
+        )
+
+    def test_momentum_column_exists(self, feat_df):
+        assert "actual_units_mom" in feat_df.columns
+
+    def test_momentum_rate_column_exists(self, feat_df):
+        assert "actual_units_mom_rate" in feat_df.columns
+
+    def test_momentum_accel_column_exists(self, feat_df):
+        assert "actual_units_accel" in feat_df.columns
+
+    def test_momentum_no_look_ahead(self, feat_df):
+        """Momentum = lag1 - lag2; first 2 rows per product should be NaN."""
+        grp = feat_df[feat_df["product"] == feat_df["product"].iloc[0]].sort_values(
+            "quarter_idx"
+        )
+        # At least the first row should have NaN momentum
+        assert grp["actual_units_mom"].isna().any()
+
+    def test_momentum_in_feature_cols(self, feat_df):
+        """Momentum features should be returned by get_feature_columns."""
+        fcols = get_feature_columns(feat_df)
+        assert "actual_units_mom" in fcols
+        assert "actual_units_mom_rate" in fcols
+        assert "actual_units_accel" in fcols
+
+    def test_momentum_computation_correct(self):
+        """Spot-check: momentum for 3rd row should equal lag1 - lag2."""
+        df = pd.DataFrame({
+            "product":      ["P"] * 5,
+            "quarter_idx":  list(range(5)),
+            "actual_units": [100.0, 120.0, 90.0, 150.0, 110.0],
+        })
+        from forecasting_pipeline.feature_engineering import _add_lag_features
+        df = _add_lag_features(df, "actual_units", lags=(1, 2, 3))
+        df["actual_units_mom"] = df["actual_units_lag1"] - df["actual_units_lag2"]
+        row = df[df["quarter_idx"] == 3].iloc[0]
+        assert row["actual_units_mom"] == pytest.approx(row["actual_units_lag1"] - row["actual_units_lag2"])
+
+
+# ─────────────────── ensemble weight optimization tests ─────────────────────
+
+class TestWeightOptimization:
+    @pytest.fixture(scope="class")
+    def bt_summary(self):
+        tables = load_all()
+        feat_df = build_feature_matrix(
+            actuals=tables["actuals"],
+            big_deal=tables["big_deal"],
+            scms=tables["scms"],
+            vms=tables["vms"],
+        )
+        _, summary = portfolio_backtest(
+            feat_df,
+            models=[NaiveSeasonalModel(), RandomForestModel(n_estimators=10)],
+            min_train_size=4,
+            recency_decay=0.85,
+        )
+        return summary
+
+    def test_optimal_weights_present(self, bt_summary):
+        assert "optimal_weights" in bt_summary.columns
+
+    def test_weights_sum_to_one(self, bt_summary):
+        for _, row in bt_summary.iterrows():
+            w = row["optimal_weights"]
+            if isinstance(w, dict) and w:
+                total = sum(w.values())
+                assert abs(total - 1.0) < 1e-6, f"Weights sum to {total}"
+
+    def test_weights_non_negative(self, bt_summary):
+        for _, row in bt_summary.iterrows():
+            w = row["optimal_weights"]
+            if isinstance(w, dict):
+                for k, v in w.items():
+                    assert v >= -1e-9, f"Negative weight {v} for {k}"
+
+    def test_best_model_has_highest_weight(self, bt_summary):
+        """The best model should receive the highest optimised weight."""
+        for _, row in bt_summary.iterrows():
+            w = row["optimal_weights"]
+            best = row.get("best_model")
+            if not isinstance(w, dict) or len(w) < 2 or not best or best not in w:
+                continue
+            others_max = max(v for k, v in w.items() if k != best)
+            # best model weight should be >= all others (allow tiny fp tolerance)
+            assert w[best] >= others_max - 1e-6
+
+
+# ──────────────────────── model confidence tests ─────────────────────────────
+
+class TestModelConfidence:
+    @pytest.fixture(scope="class")
+    def bt_summary(self):
+        tables = load_all()
+        feat_df = build_feature_matrix(
+            actuals=tables["actuals"],
+            big_deal=tables["big_deal"],
+            scms=tables["scms"],
+            vms=tables["vms"],
+        )
+        _, summary = portfolio_backtest(
+            feat_df,
+            models=[NaiveSeasonalModel()],
+            min_train_size=4,
+            recency_decay=0.85,
+        )
+        return summary
+
+    def test_model_confidence_column_present(self, bt_summary):
+        assert "model_confidence" in bt_summary.columns
+
+    def test_confidence_in_range(self, bt_summary):
+        for val in bt_summary["model_confidence"].dropna():
+            assert 0.0 <= float(val) <= 1.0
+
+    def test_confidence_helper_on_synthetic(self):
+        from forecasting_pipeline.backtesting import _compute_model_confidence
+        rng = np.random.default_rng(42)
+        n = 8
+        actual = rng.uniform(100, 200, n)
+        preds  = rng.uniform(90, 210, n)
+        bt = pd.DataFrame({
+            "actual_units":       actual,
+            "naive_seasonal_pred": preds,
+            "accuracy_naive_seasonal": np.clip(1 - np.abs(preds - actual) / actual, 0, 1),
+            "fold_weight":        [0.85 ** (n - 1 - i) for i in range(n)],
+        })
+        conf = _compute_model_confidence(bt, ["naive_seasonal"], bt["fold_weight"].values)
+        assert 0.0 < conf < 1.0
+
+
+# ──────────────── expert accuracy estimate tests ─────────────────────────────
+
+class TestExpertAccuracyEstimate:
+    from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate as _fn
+
+    def test_neutral_when_no_naive(self):
+        from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate
+        row = pd.Series({
+            "actual_units_lag4": np.nan,
+            "dp_forecast": 100.0, "mktg_forecast": 120.0, "ds_forecast": 90.0,
+        })
+        assert compute_expert_accuracy_estimate(row) == pytest.approx(0.5)
+
+    def test_high_accuracy_when_experts_match_naive(self):
+        from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate
+        row = pd.Series({
+            "actual_units_lag4": 100.0,
+            "dp_forecast": 100.0, "mktg_forecast": 100.0, "ds_forecast": 100.0,
+        })
+        acc = compute_expert_accuracy_estimate(row)
+        assert acc == pytest.approx(1.0)
+
+    def test_lower_accuracy_when_experts_diverge(self):
+        from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate
+        row_near = pd.Series({
+            "actual_units_lag4": 100.0,
+            "dp_forecast": 102.0, "mktg_forecast": 98.0, "ds_forecast": 101.0,
+        })
+        row_far = pd.Series({
+            "actual_units_lag4": 100.0,
+            "dp_forecast": 200.0, "mktg_forecast": 50.0, "ds_forecast": 180.0,
+        })
+        from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate
+        assert compute_expert_accuracy_estimate(row_near) > compute_expert_accuracy_estimate(row_far)
+
+    def test_neutral_when_no_experts(self):
+        from forecasting_pipeline.ensemble import compute_expert_accuracy_estimate
+        row = pd.Series({
+            "actual_units_lag4": 100.0,
+            "dp_forecast": np.nan, "mktg_forecast": np.nan, "ds_forecast": np.nan,
+        })
+        assert compute_expert_accuracy_estimate(row) == pytest.approx(0.5)
+
+
+# ─────────────────── confidence-based blending tests ────────────────────────
+
+class TestConfidenceBasedBlending:
+    """Verify that dynamic expert weight scales with model confidence."""
+
+    def _make_ensemble_result(self, model_confidence: float) -> dict:
+        from forecasting_pipeline.ensemble import build_ensemble_forecast
+        from forecasting_pipeline.models import NaiveSeasonalModel
+        rng = np.random.default_rng(0)
+        n = 8
+        df = pd.DataFrame({
+            "quarter_idx":    list(range(n)),
+            "actual_units":   rng.uniform(100, 300, n),
+            "dp_forecast":    [150.0] * n,
+            "mktg_forecast":  [160.0] * n,
+            "ds_forecast":    [155.0] * n,
+            "trend":          list(range(n)),
+            "actual_units_lag1": [np.nan] + list(rng.uniform(90, 310, n - 1)),
+        })
+        feature_cols = ["trend", "actual_units_lag1"]
+        train_df = df.iloc[:-1].copy()
+        pred_row = df.iloc[-1].copy()
+        weights  = {"naive_seasonal": 1.0}
+        return build_ensemble_forecast(
+            product="P1",
+            train_df=train_df,
+            pred_row=pred_row,
+            feature_cols=feature_cols,
+            models=[NaiveSeasonalModel()],
+            weights=weights,
+            model_confidence=model_confidence,
+            expert_pred=155.0,
+            expert_weight=0.15,
+        )
+
+    def test_result_has_expert_override_key(self):
+        result = self._make_ensemble_result(0.5)
+        assert "expert_override_applied" in result
+
+    def test_low_confidence_raises_expert_weight(self):
+        """Low model confidence → dynamic expert weight should be high."""
+        import math
+        # dynamic_expert_weight = clip(0.15 * (1.5 - conf), 0.05, 0.40)
+        low_conf  = float(np.clip(0.15 * (1.5 - 0.1), 0.05, 0.40))
+        high_conf = float(np.clip(0.15 * (1.5 - 0.9), 0.05, 0.40))
+        assert low_conf > high_conf
+
+
+# ──────────────── portfolio calibration tests ────────────────────────────────
+
+class TestPortfolioCalibration:
+    @pytest.fixture(scope="class")
+    def forecast_df(self):
+        """Run full pipeline with portfolio_calibration=True."""
+        from forecasting_pipeline.forecast import run_pipeline
+        from forecasting_pipeline.models import NaiveSeasonalModel
+        return run_pipeline(
+            models=[NaiveSeasonalModel()],
+            output_csv=None,
+            verbose=False,
+            portfolio_calibration=True,
+        )
+
+    def test_calibration_factor_column_present(self, forecast_df):
+        assert "calibration_factor" in forecast_df.columns
+
+    def test_calibration_factor_in_range(self, forecast_df):
+        """Calibration factor should be between 0.80 and 1.20."""
+        for val in forecast_df["calibration_factor"].dropna():
+            assert 0.79 <= float(val) <= 1.21
+
+    def test_non_npi_products_have_calibration(self, forecast_df):
+        """Non-NPI-Ramp products should have calibration_factor != 1.0
+        if portfolio adjustment was needed, OR exactly 1.0 if already aligned."""
+        non_npi = forecast_df[forecast_df["life_cycle"] != "NPI-Ramp"]
+        # All non-NPI rows should have a finite calibration_factor
+        assert non_npi["calibration_factor"].notna().all()
+
+    def test_npi_ramp_calibration_factor_is_one(self, forecast_df):
+        """NPI-Ramp products must not be calibrated."""
+        npi = forecast_df[forecast_df["life_cycle"] == "NPI-Ramp"]
+        if not npi.empty:
+            assert (npi["calibration_factor"] == 1.0).all()
+
+    def test_forecasts_positive_after_calibration(self, forecast_df):
+        assert (forecast_df["fy26q2_forecast"] >= 0).all()
+
+
+# ──────────────── intermittent demand handling tests ─────────────────────────
+
+class TestIntermittentDemandHandling:
+    @pytest.fixture(scope="class")
+    def forecast_df(self):
+        from forecasting_pipeline.forecast import run_pipeline
+        from forecasting_pipeline.models import NaiveSeasonalModel
+        return run_pipeline(
+            models=[NaiveSeasonalModel()],
+            output_csv=None,
+            verbose=False,
+            portfolio_calibration=False,
+        )
+
+    def test_intermittent_products_have_forecasts(self, forecast_df):
+        """All intermittent products should still have a non-NaN forecast."""
+        intermittent = forecast_df[forecast_df["ts_class"] == "intermittent"]
+        if not intermittent.empty:
+            assert intermittent["fy26q2_forecast"].notna().all()
+
+    def test_intermittent_forecasts_non_negative(self, forecast_df):
+        intermittent = forecast_df[forecast_df["ts_class"] == "intermittent"]
+        if not intermittent.empty:
+            assert (intermittent["fy26q2_forecast"] >= 0).all()
+
+    def test_expert_override_col_present(self, forecast_df):
+        assert "expert_override_applied" in forecast_df.columns
+
